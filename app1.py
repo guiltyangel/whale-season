@@ -1,5 +1,5 @@
 import streamlit as st
-from jackpot_tracker import scan_latest_whale_season_packs
+from whaleseason_tracker import scan_latest_whale_season_packs
 
 # ============================================================
 # PAGE CONFIG
@@ -89,3 +89,4 @@ st.caption(
     "Scanner decode event log trực tiếp từ ABI – "
     "không phụ thuộc token transfer hay explorer mapping."
 )
+
