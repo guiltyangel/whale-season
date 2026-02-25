@@ -1,119 +1,123 @@
-import time
 import requests
-from typing import Dict, List
-from eth_utils import keccak, to_checksum_address
+import time
+from typing import List, Dict, Optional
+from requests.exceptions import ReadTimeout, ConnectionError
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
-
-BASE_BLOCKSCOUT_V2 = "https://base.blockscout.com/api/v2"
-REQUEST_DELAY = 0.4
-MAX_SCAN_BLOCKS = 6000
-
-TARGET_PACK_TYPE = "whale-season"
+BASE_BLOCKSCOUT_API = "https://base.blockscout.com/api"
+USDC_ADDRESS = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".lower()
 RIPS_MANAGER = "0x7f84b6cd975db619e3f872e3f8734960353c7a09".lower()
 
-# ============================================================
-# EVENT SIGNATURE
-# ============================================================
+# Hex của chuỗi "whale-season" để nhận diện trong data log
+TARGET_PACK_HEX = "7768616c652d736561736f6e" 
 
-EVENT_SIGNATURE = "PackPurchased(address,string,string)"
-EVENT_TOPIC0 = "0x" + keccak(text=EVENT_SIGNATURE).hex()
+REQUEST_DELAY = 0.5  # Tránh bị Blockscout chặn (Rate Limit)
+MAX_RETRIES = 3      
+MAX_LOOKAHEAD_BLOCKS = 50 
 
 # ============================================================
-# HTTP SAFE GET
+# HTTP HELPERS
 # ============================================================
-
-def _get(url: str, retries: int = 2) -> Dict:
-    time.sleep(REQUEST_DELAY)
-    for _ in range(retries):
+def _get(url: str) -> Dict:
+    for i in range(MAX_RETRIES):
         try:
-            r = requests.get(url, timeout=30)
-            if r.status_code == 200:
-                return r.json()
-        except Exception:
-            pass
-        time.sleep(0.4)
+            time.sleep(REQUEST_DELAY)
+            headers = {"User-Agent": "Mozilla/5.0"}
+            r = requests.get(url, headers=headers, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        except (ReadTimeout, ConnectionError):
+            if i == MAX_RETRIES - 1: raise
+            time.sleep(2)
     return {}
 
-# ============================================================
-# ABI STRING DECODER (NO eth-abi)
-# ============================================================
-
-def _read_string(data: bytes, offset: int) -> str:
-    start = int.from_bytes(data[offset:offset+32], "big")
-    strlen = int.from_bytes(data[start:start+32], "big")
-    return data[start+32:start+32+strlen].decode("utf-8", errors="ignore")
-
-def decode_pack_event(log: Dict) -> Dict | None:
-    try:
-        if log["topics"][0].lower() != EVENT_TOPIC0.lower():
-            return None
-
-        buyer = to_checksum_address("0x" + log["topics"][1][-40:])
-
-        data = bytes.fromhex(log["data"][2:])
-        pack_type = _read_string(data, 0)
-        pack_id = _read_string(data, 32)
-
-        if pack_type != TARGET_PACK_TYPE:
-            return None
-
-        return {
-            "buy_tx_hash": log["transaction_hash"],
-            "buyer": buyer,
-            "pack_type": pack_type,
-            "pack_id": pack_id,
-            "buy_block": int(log["block_number"]),
-        }
-
-    except Exception:
-        return None
-
-# ============================================================
-# BLOCK / TX HELPERS
-# ============================================================
-
-def get_latest_block() -> int:
-    data = _get(f"{BASE_BLOCKSCOUT_V2}/blocks?limit=1&sort=desc")
-    return int(data["items"][0]["height"])
-
-def get_block_transactions(block: int) -> List[Dict]:
-    data = _get(f"{BASE_BLOCKSCOUT_V2}/blocks/{block}/transactions")
-    return data.get("items", [])
-
 def get_tx_logs(tx_hash: str) -> List[Dict]:
-    data = _get(f"{BASE_BLOCKSCOUT_V2}/transactions/{tx_hash}/logs")
-    return data.get("items", [])
+    url = f"{BASE_BLOCKSCOUT_API}?module=logs&action=getLogs&txhash={tx_hash}"
+    data = _get(url)
+    result = data.get("result", [])
+    return result if isinstance(result, list) else []
 
 # ============================================================
-# MAIN SCANNER
+# LOGIC: DYNAMIC DATA SCANNING
 # ============================================================
+def is_buy_whale_season(tx_hash: str) -> bool:
+    """Quét toàn bộ logs trong TX để tìm nội dung whale-season."""
+    logs = get_tx_logs(tx_hash)
+    for log in logs:
+        data = log.get("data", "").lower()
+        # Tìm kiếm trực tiếp chuỗi hex của whale-season trong data
+        if TARGET_PACK_HEX in data:
+            return True
+    return False
+
+def find_reward_payout(buyer: str, buy_block: int) -> Optional[Dict]:
+    """Tìm giao dịch trả thưởng (Token Transfer) từ Manager tới Buyer."""
+    start = buy_block + 1
+    end = buy_block + MAX_LOOKAHEAD_BLOCKS
+    url = (f"{BASE_BLOCKSCOUT_API}?module=account&action=tokentx"
+           f"&address={RIPS_MANAGER}&startblock={start}&endblock={end}&sort=asc")
+    
+    data = _get(url)
+    transfers = data.get("result", [])
+    if not isinstance(transfers, list): return None
+
+    payouts = [t for t in transfers if t.get("to", "").lower() == buyer.lower()]
+    if not payouts: return None
+
+    payout_tx = payouts[0].get("hash")
+    reward_tokens = []
+    for t in payouts:
+        if t.get("hash") == payout_tx:
+            decimal = int(t.get("tokenDecimal", 18))
+            amount = int(t.get("value", 0)) / (10 ** decimal)
+            reward_tokens.append({
+                "token_symbol": t.get("tokenSymbol", "Unknown"),
+                "amount": amount
+            })
+
+    return {
+        "reward_tx_hash": payout_tx,
+        "reward_block": int(payouts[0].get("blockNumber", 0)),
+        "reward_tokens": reward_tokens
+    }
 
 def scan_latest_whale_season_packs(target_count: int) -> List[Dict]:
-    latest = get_latest_block()
-    found: List[Dict] = []
+    results = []
+    page = 1
+    processed_txs = set()
 
-    scanned = 0
-    block = latest
+    # Sử dụng phân trang (offset=50) thay vì quét từng block đơn lẻ để tránh Timeout
+    while len(results) < target_count and page <= 50:
+        url = (f"{BASE_BLOCKSCOUT_API}?module=account&action=tokentx"
+               f"&address={RIPS_MANAGER}&page={page}&offset=50&sort=desc")
+        
+        data = _get(url)
+        transfers = data.get("result", [])
+        if not isinstance(transfers, list) or not transfers: break
 
-    while block > 0 and scanned < MAX_SCAN_BLOCKS:
-        txs = get_block_transactions(block)
+        for t in transfers:
+            tx_hash = t.get("hash")
+            if not tx_hash or tx_hash in processed_txs: continue
+            processed_txs.add(tx_hash)
 
-        for tx in txs:
-            if tx.get("to_address", "").lower() != RIPS_MANAGER:
-                continue
+            # Điều kiện: Người dùng gửi USDC tới contract RIPS_MANAGER
+            if (t.get("tokenAddress", "").lower() == USDC_ADDRESS and 
+                t.get("to", "").lower() == RIPS_MANAGER):
+                
+                # Kiểm tra nội dung whale-season trong logs của TX này
+                if is_buy_whale_season(tx_hash):
+                    buyer = t.get("from", "").lower()
+                    buy_block = int(t.get("blockNumber", 0))
+                    reward = find_reward_payout(buyer, buy_block)
 
-            logs = get_tx_logs(tx["hash"])
-            for log in logs:
-                event = decode_pack_event(log)
-                if event:
-                    found.append(event)
-                    if len(found) >= target_count:
-                        return found
-
-        block -= 1
-        scanned += 1
-
-    return found
+                    results.append({
+                        "buy_tx_hash": tx_hash,
+                        "buy_block": buy_block,
+                        "buyer": buyer,
+                        "reward": reward
+                    })
+                    if len(results) >= target_count: break
+        page += 1
+    return results
