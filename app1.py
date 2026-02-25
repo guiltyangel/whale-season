@@ -1,5 +1,5 @@
 import streamlit as st
-from jackpot_tracker import scan_latest_whale_season_packs
+from whaleseason_tracker import scan_latest_whale_season_packs
 
 st.set_page_config(page_title="Whale Season Scanner", page_icon="🐋", layout="wide")
 
@@ -30,3 +30,4 @@ if st.sidebar.button("🚀 Bắt đầu quét", type="primary"):
                             st.info("Chưa tìm thấy TX trả thưởng trong phạm vi 50 block.")
         except Exception as e:
             st.error(f"Lỗi: {e}")
+
